@@ -1,8 +1,10 @@
 # Docker入门
 
+
+
 ## Java应用容器化最佳实践
 
-本文以多模块Gradle项目为例，进行一次容器化实战最贱实践，
+本文以多模块Gradle项目为例，进行一次容器化最佳实践，
 
 容器化的期望：
 
@@ -11,21 +13,22 @@
 
 本文用到的软件版本如下:
 
-| 软件     | 版本    | 备注            |
-| ------ | ----- | ------------- |
-| Java   | 1.8   |               |
-| Docker | 20    | 17+版本支持了多阶段构建 |
-| Gradle | 7.4.2 |               |
+| 软件         | 版本                            | 备注            |
+| ---------- | ----------------------------- | ------------- |
+| Java       | 1.8                           |               |
+| Docker     | 20                            | 17+版本支持了多阶段构建 |
+| Gradle     | 7.4.2                         |               |
+| Buildpacks | 0.25.0+git-b9be13a.build-3254 |               |
 
 应用容器化方案
 
-| 方案                            | 配置形式           | 优势                                            | 劣势                                 |
-| ----------------------------- | -------------- | --------------------------------------------- | ---------------------------------- |
-| Docker multi stage            | Dockerfile     | <p>1.构建自由度高<br>2.</p>                         | <p>1. Dockerfile编写繁琐<br>2.<br></p> |
-| Buildpacks                    | Proc           | 1.针对于小白上手难度低                                  | <p>1. 构建产物体积大<br>2.<br></p>        |
-| Jib                           | gradle/maven配置 | <p>1.配置简单，无需编写其他的Dockerfile<br>2.<br><br></p> |                                    |
-| BuildKit                      | Dockerfile     | 1.并发构建快                                       |                                    |
-| Docker multi stage + BuildKit |                |                                               |                                    |
+| 方案                 | 配置形式           | 优势                                                                           | 劣势                                 |
+| ------------------ | -------------- | ---------------------------------------------------------------------------- | ---------------------------------- |
+| Docker multi stage | Dockerfile     | <p>1.构建自由度高<br>2.</p>                                                        | <p>1. Dockerfile编写繁琐<br>2.<br></p> |
+| Buildpacks         | Procfile       | <p>1.针对于小白上手难度低<br>2.自动检测使用框架技术和jdk</p>                                      | <p>1. 构建产物体积大<br>2.<br></p>        |
+| Jib                | gradle/maven配置 | <p>1.配置简单，无需编写其他的Dockerfile<br>2.jib在构建过程中会自定把镜像push到ccr仓库<br>3.<br><br></p> |                                    |
+| BuildKit           | Dockerfile     | <p>1.并发构建快<br>2.通过挂载本地文件系统可以缓存依赖<br></p>                                     |                                    |
+|                    |                |                                                                              |                                    |
 
 #### 如何构建一个优质的Docker镜像？
 
@@ -47,7 +50,8 @@ alpine镜像github地址：https://github.com/alpinelinux/docker-alpine
 2. 安装Docker 20.10.11版本
 3. 安装Buildpacks
 4. 安装BuildKit
-5. 准备一个多模块的Gradle项目
+5. 安装Gradle
+6. 准备一个Gradle多模块项目，本文示例项目github地址：https://github.com/Maple-mxf/microservices-backend
 
 Demo项目结构
 
@@ -62,18 +66,15 @@ Demo项目结构
 └── settings.gradle.kts						 gradle项目设置文件
 ```
 
-Demo项目地址：TODO 贴上github地址
-
 #### 前提说明
 
 为了更客观的测试以上方案的优劣，增加以下前提
 
 1. 提前下载构建过程中可能用到的基础镜像
 2. 使用依赖缓存镜像来加速Java应用的构建
+3. 提前在构建机器上登陆dockerhub，来避免因为高频率拉镜像被限流
 
 #### Docker multi stage构建
-
-TODO 画图多阶段构建
 
 依赖缓存基础镜像Dockerfile.cache（文件名）
 
@@ -87,11 +88,15 @@ FROM gradle:jdk8 as builder
 COPY --from=builder /root/gradle_cache /root/.gradle
 ```
 
-构建指令 TODO. 使用github地址代替
+构建指令
 
 ```shell
-docker build -f ./Dockerfile.cache -t gradle-cache:latest .
+  docker build \
+  --file Dockerfile.cache \
+  --tag  gradle-cache:latest  https://github.com/Maple-mxf/microservices-backend.git
 ```
+
+note:构建上下文设定为github仓库，详情参考[docker build指南](https://docs.docker.com/engine/reference/commandline/build/)
 
 构建的依赖缓存镜像如下
 
@@ -103,56 +108,61 @@ gradle-cache   latest    e6d630b62a0c   5 hours ago   997MB
 
 Java应用容器化Dockerfile（文件名）
 
+如下Dockerfile为最终构建gradle模块的Dockerfile
+
+1. CACHE\_IMAGE动态表示缓存的gradle依赖的镜像
+2. MODULE表示要构建的gradle模块名称
+3. 在执行构建命令时通过build-args选项参数注入对应的值
+
 ```dockerfile
 ARG CACHE_IMAGE
 
 FROM ${CACHE_IMAGE} as jarBuilder
+ARG MODULE
 WORKDIR  /app
 COPY  ./ /app
-RUN gradle :backend-gateway:bootJar -i --stacktrace --no-daemon
+RUN gradle :${MODULE}:bootJar -i --stacktrace --no-daemon && ls -a
 
-FROM azul/zulu-openjdk-alpine:11 as packager
-ENV JAVA_MINIMAL=/opt/jre
+FROM alpine:3.13
+ARG MODULE
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.tencent.com/g' /etc/apk/repositories \
+    && apk add --update --no-cache openjdk8-jre-base \
+    && rm -f /var/cache/apk/*
 WORKDIR /app
-COPY --from=jarBuilder /app/build/*.jar  .
-RUN jlink \
-    --verbose \
-    --add-modules \
-        java.base,java.sql,java.naming,java.desktop,java.management,java.security.jgss,java.instrument \
-    --compress 2 \
-    --strip-debug \
-    --no-header-files \
-    --no-man-pages \
-    --output "$JAVA_MINIMAL"
-
-FROM alpine
-WORKDIR /app
-ENV JAVA_MINIMAL=/opt/jre
-ENV PATH="$PATH:$JAVA_MINIMAL/bin"
-COPY --from=packager "$JAVA_MINIMAL" "$JAVA_MINIMAL"
-COPY --from=jarBuilder /app/*.jar  .
-CMD ["java", "-jar", "backend-gateway-1.0-boot.jar"]
+COPY --from=jarBuilder /app/build/${MODULE}-*-boot.jar  ./app.jar
+CMD ["sleep", "1h"]
 ```
 
-构建指令 TODO. 使用github地址代替 docker build GitHub.....详细参考https://docs.docker.com/engine/reference/commandline/build/
+_Note:Dockerfile的Arg标记有生效范围，如果只在FROM指令声明，则只在FROM中生效_
+
+构建指令
 
 ```shell
-# docker images --filter=reference="backend-gateway:1.0"
-REPOSITORY        TAG       IMAGE ID       CREATED          SIZE
-backend-gateway   1.0       4986f3640885   35 seconds ago   103MB
+docker build \
+--no-cache  \
+--build-arg MODULE="backend-gateway" \
+--build-arg CACHE_IMAGE="gradle-cache:latest" \
+--tag "backend-gateway":"3.0"  https://github.com/Maple-mxf/microservices-backend.git \
+&& docker image prune -f 
 ```
 
-TODO
+查看docker构建好的产物
 
-1 多阶段构建会产生很多中间镜像
+```shell
+# docker images --filter=reference="backend-gateway:3.0"
+REPOSITORY        TAG       IMAGE ID       CREATED         SIZE
+backend-gateway   3.0       36eb9bc545b4   4 minutes ago   124MB
+```
 
-2 是否应该保存中间镜像？不保留怎么清除中间镜像
+_Notes:由于docker multi stage构建会产生很多的中间镜像，所以执行了 docker image prune -f 清除中间的多余镜像_
 
 #### Buildpacks
 
 buildpacks文档：https://buildpacks.io/docs/
 
 heroku构建gradle项目指南文档：https://devcenter.heroku.com/articles/deploying-gradle-apps-on-heroku
+
+buildpacks属于一款重量级自动构建工具，无需编写Dockerfile
 
 查看buildpacks推荐的builder
 
@@ -180,6 +190,85 @@ java -Dserver.port=8080 -jar build/backend-gateway-1.0-boot.jar
 pack build --path=./ --builder heroku/buildpacks:20 backend-gateway:latest
 ```
 
+构建输出
+
+```shell
+20: Pulling from heroku/buildpacks
+Digest: sha256:e7d4a2fce9218495c599bf2d5f790632d81fae1a4872f92fcdfababa6a33b415
+Status: Image is up to date for heroku/buildpacks:20
+20: Pulling from heroku/pack
+Digest: sha256:4559f682a6a7c57a4f1252a85c08d052e9e748126101938f28d37bd5ff63cf3b
+Status: Image is up to date for heroku/pack:20
+===> ANALYZING
+Previous image with name "backend-gateway:20220503175029" not found
+===> DETECTING
+heroku/gradle   0.0.35
+heroku/procfile 0.6.2
+===> RESTORING
+===> BUILDING
+-----> Spring Boot detected
+-----> Installing JDK 11... done
+-----> Building Gradle app...
+-----> executing ./gradlew build -x check
+       Downloading https://services.gradle.org/distributions/gradle-7.4.2-bin.zip
+       ...........10%...........20%...........30%...........40%...........50%...........60%...........70%...........80%...........90%...........100%
+       To honour the JVM settings for this build a single-use Daemon process will be forked. See https://docs.gradle.org/7.4.2/userguide/gradle_daemon.html#sec:disabling_the_daemon.
+       Daemon will be stopped at the end of the build 
+       > Task :compileJava NO-SOURCE
+       > Task :processResources NO-SOURCE
+       > Task :classes UP-TO-DATE
+       > Task :bootJar SKIPPED
+       > Task :jar SKIPPED
+       > Task :assemble SKIPPED
+       > Task :build SKIPPED
+       > Task :backend-gateway:compileJava
+       > Task :backend-gateway:processResources
+       > Task :backend-gateway:classes
+       > Task :backend-gateway:bootJar
+       > Task :backend-gateway:jar SKIPPED
+       > Task :backend-gateway:assemble
+       > Task :backend-gateway:build
+       
+       BUILD SUCCESSFUL in 1m 36s
+       3 actionable tasks: 3 executed
+[INFO] Discovering process types
+[INFO] Procfile declares types -> web
+===> EXPORTING
+Adding layer 'heroku/gradle:profile'
+Adding 1/1 app layer(s)
+Adding layer 'launcher'
+Adding layer 'config'
+Adding layer 'process-types'
+Adding label 'io.buildpacks.lifecycle.metadata'
+Adding label 'io.buildpacks.build.metadata'
+Adding label 'io.buildpacks.project.metadata'
+Setting default process type 'web'
+Saving backend-gateway:20220503175029...
+*** Images (76d79a8ab094):
+      backend-gateway:20220503175029
+Adding cache layer 'heroku/gradle:shim'
+Successfully built image backend-gateway:20220503175029
+Build success, buildType=buildpacks,costTime=2m11s
+```
+
+查看构建完成后的产物
+
+```shell
+# docker images --filter=reference="backend-gateway:20220503175029"
+REPOSITORY        TAG              IMAGE ID       CREATED        SIZE
+backend-gateway   20220503175029   76d79a8ab094   42 years ago   802MB
+```
+
+指定Java版本，参考文档[buildpacks文档](https://devcenter.heroku.com/articles/java-support#specifying-a-java-version)
+
+项目根目录下新增system.properties
+
+```properties
+java.runtime.version=11
+```
+
+_Note:buildpacks构建的缺点也很明显，会默认构建所有的gradle项目模块_
+
 #### Jib构建
 
 docker login https://github.com/GoogleContainerTools/jib/blob/master/docs/faq.md#what-should-i-do-when-the-registry-responds-with-unauthorized
@@ -194,9 +283,204 @@ plugins {
 gradle :backend-gateway:jib --image=ccr.ccs.tencentyun.com/tcb-2446011668-egvs/backend-gateway
 ```
 
-BuildKit构建：
+构建指令
+
+```shell
+gradle :gateway-backend:jib --image=ccr.tencent.com/2446011668/backend-gateway:1.0
+```
+
+查看产物大小
+
+jib构建日志
+
+```shell
+Containerizing application to ccr.ccs.tencentyun.com/tcb-2446011668-egvs/backend-gateway:20220503180517...
+Base image 'openjdk:alpine' does not use a specific image digest - build may not be reproducible
+Using credentials from Docker config (/root/.docker/config.json) for ccr.ccs.tencentyun.com/tcb-2446011668-egvs/backend-gateway:20220503180517
+The base image requires auth. Trying again for openjdk:alpine...
+Using credentials from Docker config (/root/.docker/config.json) for openjdk:alpine
+Using base image with digest: sha256:1fd5a77d82536c88486e526da26ae79b6cd8a14006eb3da3a25eb8d2d682ccd6
+
+Container entrypoint set to [java, -Xms512m, -Xdebug, -cp, /app/resources:/app/classes:/app/libs/*, backend.router.BackendRouterApp]
+
+Built and pushed image as ccr.ccs.tencentyun.com/tcb-2446011668-egvs/backend-gateway:20220503180517
+Executing tasks:
+[==============================] 100.0% complete
 
 
+BUILD SUCCESSFUL in 16s
+3 actionable tasks: 3 executed
+Build success, buildType=jib,costTime=17s
+```
 
+jib构建速度快，并且jib会自动的把镜像推到仓库，只需要将--image参数换成对应的container registry
 
+jib自定义配置. 参考[jib gradle配置文档](https://github.com/GoogleContainerTools/jib/tree/master/jib-gradle-plugin#quickstart)
 
+```
+   jib {
+        from {
+            image = "openjdk:alpine"
+        }
+        container {
+            mainClass = "backend.router.BackendRouterApp"
+            ports = mutableListOf("8080")
+            jvmFlags = mutableListOf("-Xms512m", "-Xdebug")
+            format = com.google.cloud.tools.jib.api.buildplan.ImageFormat.OCI
+        }
+    }
+```
+
+jib插件扩展. 参考[jib extension开发文档](https://github.com/GoogleContainerTools/jib-extensions)
+
+#### BuildKit构建
+
+buildkit是下一代的构建工具
+
+buildkit项目github地址：https://github.com/moby/buildkit
+
+Docker开启buildkit支持，在/etc/docker/daemon.json增加以下配置
+
+```json
+{"features": { "buildkit": true }}
+```
+
+由于Buildkit是实验特性，并且需要在Dockerfile首行中增加以下注释
+
+```dockerfile
+# syntax = docker/dockerfile:experimental
+```
+
+Dockerfile
+
+```dockerfile
+# syntax = docker/dockerfile:experimental
+FROM gradle:jdk8 as jarBuilder
+WORKDIR /app
+COPY . ./
+RUN --mount=type=cache,target=~/.gradle/,id=gradle_repo_cache,sharing=locked
+ARG MODULE
+RUN gradle :${MODULE}:bootJar -i --stacktrace --no-daemon
+
+FROM alpine:3.13
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.tencent.com/g' /etc/apk/repositories \
+    && apk add --update --no-cache openjdk8-jre-base \
+    && rm -f /var/cache/apk/*
+WORKDIR /app
+ARG MODULE
+COPY --from=jarBuilder /app/build/${MODULE}-*-boot.jar  ./app.jar
+CMD ["sleep", "1h"]
+```
+
+执行构建命令
+
+```shell
+docker build \
+--no-cache  \
+--build-arg MODULE=backend-gateway \
+--file Dockerfile.buildkit \
+--tag backend-gateway:buiuldkit  https://github.com/Maple-mxf/microservices-backend
+```
+
+构建方案对比
+
+| 构建方式               | 耗时      | 产物大小  | 制品类型         |
+| ------------------ | ------- | ----- | ------------ |
+| Docker multi stage | 14s     | 124MB | Docker-Image |
+| BuildKit           | 15s     | 124MB | Docker-Image |
+| Buildpacks         | 1min30s | 802MB | Docker-Image |
+| Jib                | 16s     | 146MB | OCI-Image-v1 |
+|                    |         |       |              |
+
+构建脚本
+
+```shell
+#!/bin/bash
+
+# 自定义gradle缓存镜像(原生docker构建需要此基础镜像加速构建)
+cache_image_name="gradle-cache:latest"
+
+# 远程构建的git仓库上下文
+gitRepo="https://github.com/Maple-mxf/microservices-backend"
+
+# 需要构建的模块
+module="$1"
+
+# 构建方式，可选有 docker|buildpakcks|jib|buildkit
+buildType="$2"
+
+# 构建的镜像版本
+version=$(date +'%Y%m%d%H%M%S')
+
+# 远程镜像仓库
+remoteCR="ccr.ccs.tencentyun.com/tcb-2446011668-egvs/"
+
+echo "module is $module"
+
+if [ -z "$module" ];then
+    echo "module args require"
+    exit 0
+fi
+if [ -z "$buildType" ];then
+    echo "default buildType is docker"
+    buildType="docker"
+fi
+
+# docker images filter cmd https://docs.docker.com/engine/reference/commandline/images/
+if [[ -n $(docker images -q --filter=reference=$cache_image_name) ]];then
+    echo "Found gradle cache images"
+else
+  echo "Not Found gradle cache images. process docker build"
+  docker build \
+  -f Dockerfile.cache \
+  -t ${cache_image_name} ${gitRepo}
+fi
+
+# 构建镜像
+timer_start=$(date "+%Y-%m-%d %H:%M:%S")
+
+case $buildType in
+"docker")
+docker build \
+--no-cache  \
+--build-arg MODULE="${module}" \
+--build-arg CACHE_IMAGE="${cache_image_name}" \
+--tag "${module}":"${version}" ${gitRepo} \
+&& docker image prune -f
+;;
+
+"buildpacks")
+pack build --path=./ --builder heroku/buildpacks:20 "${module}":"${version}"
+;;
+
+"buildkit")
+docker build \
+--no-cache  \
+--build-arg MODULE="${module}" \
+--build-arg CACHE_IMAGE="${cache_image_name}" \
+--file Dockerfile.buildkit \
+--tag "${module}":"${version}" ${gitRepo}
+;;
+
+"jib")
+gradle :"${module}":jib --image=$remoteCR"${module}":"${version}"
+;;
+esac
+
+timer_end=$(date "+%Y-%m-%d %H:%M:%S")
+duration=$(echo $(($(date +%s -d "${timer_end}") - $(date +%s -d "${timer_start}"))) | awk '{t=split("60 s 60 m 24 h 999 d",a);for(n=1;n<t;n+=2){if($1==0)break;s=$1%a[n]a[n+1]s;$1=int($1/a[n])}print s}')
+
+echo "Build success, buildType=$buildType,costTime=$duration"
+```
+
+下载远程构建脚本并且构建本文示例的gradle demo项目
+
+1. ```shell
+   curl https://raw.githubusercontent.com/apache/apisix/master/utils/install-dependencies.sh -sL | bash -
+   ```
+
+TODO：
+
+1. Buildpacks优化（cache-image和volume）
+2. Jib优化
+3. OCI 和 Docker格式的镜像区分
